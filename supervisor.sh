@@ -62,9 +62,7 @@ for ((i = 1; i <= MAX_ITERS; i++)); do
   echo
   echo "──── iteration $i / $MAX_ITERS ────"
 
-  claude --print \
-    --permission-mode acceptEdits \
-    --dangerously-skip-permissions "
+  PROMPT="
 Read $PLAN_FILE and $STATUS_FILE.
 
 You are resuming a multi-step plan. The status file lists which steps are
@@ -87,6 +85,45 @@ Rules:
   - If blocked, set blocked:true AND describe the blocker in notes. Do NOT
     invent missing information or fabricate values to push past the blocker.
 "
+
+  # Stream Claude's output as readable per-event lines (text / tool_use /
+  # tool_result / init / done), and archive the raw stream-json to
+  # .supervisor-stream.jsonl for later inspection. Falls back to the plain
+  # --print output when jq is unavailable.
+  set +e
+  if command -v jq >/dev/null 2>&1; then
+    claude --print \
+      --permission-mode acceptEdits \
+      --dangerously-skip-permissions \
+      --verbose --output-format stream-json \
+      "$PROMPT" \
+      | tee -a .supervisor-stream.jsonl \
+      | jq -rc --unbuffered '
+          if .type == "assistant" then
+            (.message.content // [])[]? |
+            if .type == "text" then
+              "  text   | " + ((.text // "") | gsub("\n"; " ") | .[0:220])
+            elif .type == "tool_use" then
+              "  tool   | " + (.name // "?") + " " + ((.input // {}) | tostring | gsub("\n"; " ") | .[0:180])
+            else empty end
+          elif .type == "user" then
+            (.message.content // [])[]? |
+            if .type == "tool_result" then
+              "  result | " + ((.content // "") | tostring | gsub("\n"; " ") | .[0:160])
+            else empty end
+          elif .type == "system" and .subtype == "init" then
+            "  init   | session=" + (.session_id // "?")
+          elif .type == "result" then
+            "  done   | " + (.subtype // "result") + " cost=$" + ((.total_cost_usd // 0) | tostring)
+          else empty end
+        ' 2>/dev/null
+  else
+    claude --print \
+      --permission-mode acceptEdits \
+      --dangerously-skip-permissions \
+      "$PROMPT"
+  fi
+  set -e
 
   if [[ ! -f "$STATUS_FILE" ]]; then
     echo "error: claude did not write $STATUS_FILE this iteration" >&2
